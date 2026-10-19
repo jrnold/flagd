@@ -4,22 +4,52 @@ This evaluator allows to split the returned variants of a feature flag into diff
 where each bucket can be assigned a weight, representing how many requests will resolve to the corresponding
 variant.
 
-The distribution must be performed by using the value of a referenced property
-from the evaluation context to hash that value and map it to a value between [0, 100]. It is important to note
-that evaluations MUST be sticky, meaning that flag resolution requests containing the same value for the
-referenced property in their context MUST always resolve to the same variant. For calculating the hash value of the
-referenced evaluation context property, the [MurmurHash3](https://github.com/aappleby/smhasher/blob/master/src/MurmurHash3.cpp)
-hash function should be used. This is to ensure that flag resolution requests yield the same result,
-regardless of which implementation of the in-process flagd provider is being used.
+The distribution must be performed by hashing a bucketing value taken from the evaluation context and
+mapping the hash to one of the buckets in proportion to their weights. It is important to note
+that evaluations MUST be sticky, meaning that flag resolution requests with the same bucketing value
+MUST always resolve to the same variant. To ensure that flag resolution requests yield the same result
+regardless of which implementation of the in-process flagd provider is being used, the bucketing value is
+encoded as deterministic CBOR and hashed with [MurmurHash3](https://github.com/aappleby/smhasher/blob/master/src/MurmurHash3.cpp),
+as described below (see the [fractional hashing ADR](../../../architecture-decisions/fractional-non-string-rand-units.md)).
 
-The supplied array must contain at least two items, with the first item being an optional [json logic variable declaration](https://jsonlogic.com/operations.html#var)
-specifying the bucketing property to base the distribution of values on. If the bucketing property expression doesn't return a string, a concatenation of the
-`flagKey` and `targetingKey` are used: `{"cat": [{"var":"$flagd.flagKey"}, {"var":"targetingKey"}]}`.
-The remaining items are `arrays`, each with at least one value, with the first being `string` item representing the name of the variant, and the
-second being an optional `float` item representing the relative weight for that variant.
-If no relative weight is specified explicitly, the weight for that variant must be set to `1` be default.
-The `data` object can be an arbitrary
-JSON object. Below is an example of a targeting rule containing a `fractional`, with relative weights assigned to the variants:
+## Arguments
+
+The supplied array must contain at least one item.
+
+1. The first item is an optional JsonLogic expression for the bucketing value.
+   - If it evaluates to anything other than an array (a string, number, boolean or object), that value is the
+     bucketing value, and the remaining items are the buckets.
+   - If it evaluates to `null`, the evaluator must log an error and return `null`.
+   - If the first item is an array, it is the first bucket, and the bucketing value is the 2-element array
+     `[flagKey, targetingKey]` (the `$flagd.flagKey` and `targetingKey` properties of the context). The
+     `targetingKey` must be a non-empty string; otherwise the evaluator must log an error and return `null`.
+2. Each bucket is an array of one or two items: the variant, and an optional weight.
+   - The variant is a string, boolean, number or `null` (or an expression evaluating to one).
+   - The weight is an integer relative weight. If no weight is specified, it must default to `1`.
+     A negative weight must be treated as `0` (weights computed by other expressions can go negative).
+     A weight that is not an integer is an error.
+   - Each weight, and the sum of all weights, must not exceed `2147483647` (2^31 - 1, Int32 max);
+     otherwise the evaluator must log an error and return `null`.
+
+Any other malformed input must also be logged and result in `null`.
+
+## Bucketing
+
+1. Normalize numbers in the bucketing value: a number with no fractional part in the range
+   [-2^63, 2^64 - 1] is encoded as an integer, and `-0` as `0`; any other number is encoded as a float.
+2. Encode the bucketing value as CBOR using the
+   [Core Deterministic Encoding Requirements](https://www.rfc-editor.org/rfc/rfc8949.html#section-4.2.1)
+   of RFC 8949 (shortest-form numbers, map keys sorted bytewise).
+3. Hash the encoded bytes with MurmurHash3 x86 32-bit (seed `0`) to an unsigned 32-bit integer `hash`.
+4. Let `totalWeight` be the sum of the weights. If it is `0`, return `null`.
+5. Compute `bucket = (hash * totalWeight) >> 32` with 64-bit unsigned arithmetic, an integer in
+   `[0, totalWeight)`.
+6. Walk the buckets in order, adding each weight to a running sum, and return the variant of the first bucket
+   whose running sum is greater than `bucket`.
+
+So each variant is selected for `weight / totalWeight` of bucketing values.
+
+Below is an example of a targeting rule containing a `fractional`, with relative weights assigned to the variants:
 
 ```json
 {
@@ -108,125 +138,99 @@ The following flow chart depicts the logic of this evaluator:
 ```mermaid
 flowchart TD
 A[Parse targetingRule] --> B{Is an array containing at least one item?};
-B -- Yes --> C{Does expression at index 0 return a string?};
-B -- No --> D[return null]
-C -- No --> E[bucketingPropertyValue := default to targetingKey];
-C -- Yes --> F[bucketingPropertyValue := targetingRule at index 0];
-E --> G[Iterate through the remaining elements of the targetingRule array and parse the variants and their relative weights];
+B -- No --> D[return null];
+B -- Yes --> C{Does the item at index 0 evaluate to an array?};
+C -- No --> N{Is it null?};
+N -- Yes --> D;
+N -- No --> F[bucketingValue := value at index 0; buckets := remaining items];
+C -- Yes --> T{Is targetingKey a non-empty string?};
+T -- No --> D;
+T -- Yes --> E[bucketingValue := array of flagKey and targetingKey; buckets := all items];
+E --> G[Parse the buckets: variant, integer weight defaulting to 1, negative weights as 0];
 F --> G;
-G --> H{Parsing successful?};
+G --> H{Parsing successful, and weights sum to at most 2^31 - 1?};
 H -- No --> D;
-H -- Yes --> J[hash := murmur3Hash of bucketingPropertyValue divided by Int64.MaxValue]
-J --> K[Iterate through the variant and increment the threshold by the relative weight of each variant. Return the first variant where the bucket is smaller than the threshold.]
+H -- Yes --> J[hash := murmur3 x86 32-bit of the deterministic CBOR encoding of bucketingValue];
+J --> L[bucket := hash * totalWeight >> 32];
+L --> K[Return the variant of the first bucket whose running weight sum is greater than bucket];
 ```
 
-As a reference, below is a simplified version of the actual implementation of this evaluator in Go.
+As a reference, below is a simplified version of the implementation of this evaluator in Go
+(see `core/pkg/evaluator/fractional.go` for the full version, including number normalization).
 
 ```go
+var cborEncMode, _ = cbor.CoreDetEncOptions().EncMode()
 
-type fractionalEvaluationDistribution struct {
-    variant    string
-    weight int
+type weightedVariant struct {
+    variant any // string, bool, number or nil
+    weight  int64
 }
 
 /*
-    values: contains the targeting rule object; e.g.:
-        [
-          {"var":"email"},
-          [
-            "red",
-            50
-          ],
-          [
-            "blue",
-            20
-          ],
-          [
-            "green",
-            30
-          ]
-        ]
-    
-    data: contains the evaluation context; e.g.:
-        {
-            "email": "test@faas.com"
-        }
-*/ 
-func FractionalEvaluation(values, data interface{}) interface{} {
-    // 1. Check if the values object contains at least two elements:
-    valuesArray, ok := values.([]interface{})
-    if !ok {
-        log.Error("fractional evaluation data is not an array")
-        return nil
-    }
-    if len(valuesArray) < 2 {
-        log.Error("fractional evaluation data has length under 2")
+    values: contains the evaluated arguments; e.g.:
+        ["test@faas.com", ["red", 50], ["blue", 20], ["green", 30]]
+    flagKey, targetingKey: from the evaluation context
+*/
+func FractionalEvaluation(values []any, flagKey string, targetingKey any) any {
+    if len(values) < 1 {
         return nil
     }
 
-    // 2. Get the target property value used for bucketing the values
-    valueToDistribute, ok := valuesArray[0].(string)
-    if !ok {
-        log.Error("first element of fractional evaluation data isn't of type string")
-        return nil
+    // 1. Choose the bucketing value
+    var bucketingValue any
+    if _, isArray := values[0].([]any); !isArray {
+        if values[0] == nil {
+            return nil
+        }
+        bucketingValue = values[0]
+        values = values[1:]
+    } else {
+        key, ok := targetingKey.(string)
+        if !ok || key == "" {
+            return nil
+        }
+        bucketingValue = []any{flagKey, key}
     }
 
-    // 3. Parse the fractional values distribution
-    sumOfWeights := 0
-    var feDistributions []fractionalEvaluationDistribution
-
-    // start at index 1, as the first item of the values array is the target property
-    for i := 1; i < len(valuesArray); i++ {
-        distributionArray, ok := values[i].([]interface{})
-        if !ok {
-            log.Error("distribution elements aren't of type []interface{}")
+    // 2. Parse the buckets
+    var variants []weightedVariant
+    var totalWeight int64
+    for _, v := range values {
+        bucket, ok := v.([]any)
+        if !ok || len(bucket) == 0 {
             return nil
         }
-
-        if len(distributionArray) == 0 {
-            log.Error("distribution element needs to have a least one value")
-            return nil
-        }
-
-        variant, ok := distributionArray[0].(string)
-        if !ok {
-            log.Error("first element of distribution element isn't a string")
-            return nil
-        }
-
-        weight := 1.0
-        if len(distributionArray) >= 2 {
-            distributionWeight, ok := distributionArray[1].(float64)
-            if ok {
-                // default the weight to 1 if not specified explicitly
-                weight = distributionWeight
+        weight := int64(1)
+        if len(bucket) >= 2 && bucket[1] != nil {
+            w, ok := bucket[1].(float64)
+            if !ok || w != math.Trunc(w) || w > math.MaxInt32 {
+                return nil
             }
+            weight = max(int64(w), 0)
         }
-
-        sumOfWeights += int(weight)
-
-        feDistributions = append(feDistributions, fractionalEvaluationDistribution{
-            variant:    variant,
-            weight: int(weight),
-        })
+        totalWeight += weight
+        variants = append(variants, weightedVariant{variant: bucket[0], weight: weight})
+    }
+    if totalWeight == 0 || totalWeight > math.MaxInt32 {
+        return nil
     }
 
-    // 4. Calculate the hash of the target property and map it to a number between [0, 99] 
-    hashValue := int32(murmur3.StringSum32(value))
-    hashRatio := math.Abs(float64(hashValue)) / math.MaxInt32
-    bucket := int(hashRatio * 100)
+    // 3. Hash the deterministic CBOR encoding of the bucketing value
+    bytes, err := cborEncMode.Marshal(normalizeValue(bucketingValue))
+    if err != nil {
+        return nil
+    }
+    hash := murmur3.Sum32(bytes)
 
-    // 5. Iterate through the variant and increment the threshold by the percentage of each variant.
-    // return the first variant where the bucket is smaller than the threshold. 
-    rangeEnd := 0
-    for _, dist := range feDistribution {
-        rangeEnd += (dist.weight / sumOfWeights) * 100
+    // 4. Map the hash to [0, totalWeight) and find its bucket
+    bucket := (uint64(hash) * uint64(totalWeight)) >> 32
+    var rangeEnd uint64
+    for _, v := range variants {
+        rangeEnd += uint64(v.weight)
         if bucket < rangeEnd {
-            // return the matching variant
-            return dist.variant
+            return v.variant
         }
     }
-
-  return nil
+    return nil
 }
 ```
